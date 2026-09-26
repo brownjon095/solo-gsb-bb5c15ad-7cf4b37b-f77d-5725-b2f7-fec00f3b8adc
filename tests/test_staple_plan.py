@@ -86,6 +86,32 @@ def test_sum_of_deviations_tiebreak_before_lex():
     assert max_deviation == 1.0
 
 
+def test_decimal_margin_picks_true_min_max_deviation():
+    # 页高 50、上留边 0.0000000003、下留边 0.5：
+    # 理想针位 16.5000000002 / 33.0000000001，
+    # [17,33] 的最大偏差 0.4999999998 严格小于 [16,33] 的 0.5000000002，
+    # 不得被判为并列后按针位字典序取 [16,33]
+    positions, max_deviation = _plan(
+        page_height_mm=50, top_margin_mm=0.0000000003, bottom_margin_mm=0.5,
+        min_spacing_mm=1, staple_count=2,
+    )
+    assert positions == [17, 33]
+    assert max_deviation == pytest.approx(0.4999999998, abs=1e-12)
+
+
+def test_decimal_margin_sum_tiebreak_not_rounded_to_tie():
+    # 理想针位 30.0000000003 / 52.0000000003 / 74.0000000003；
+    # 禁区 [30,30]、[40,53] 下最优最大偏差为 1.9999999997（第 2 针落 54），
+    # [29,54,74] 与 [31,54,74] 最大偏差相同，但偏差总和
+    # 3.0000000001 < 3.0000000003，须取 [31,54,74]
+    positions, max_deviation = _plan(
+        top_margin_mm=8.0000000003, bottom_margin_mm=3.9999999997,
+        min_spacing_mm=10, staple_count=3, forbidden=[(30, 30), (40, 53)],
+    )
+    assert positions == [31, 54, 74]
+    assert max_deviation == pytest.approx(1.9999999997, abs=1e-12)
+
+
 def test_lexicographic_tie_with_equal_sum():
     # 禁区 [20,30]、最小针距 50：理想针位 36.67/63.33，
     # [19,69] 与 [31,81] 最大偏差、偏差总和均相同 -> 取字典序最小

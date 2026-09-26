@@ -1482,11 +1482,6 @@ STAPLE_PAGE_HEIGHT_MAX_MM = 1000
 STAPLE_COUNT_MIN = 2
 STAPLE_COUNT_MAX = 4
 
-# 针位均为整数毫米刻度，最小离散误差即 0.5 mm；浮点比较取远小于该量级的
-# 容差，仅用于抵消理想针位浮点运算引入的 ULP 级偏差（如并列偏差因舍入路径
-# 不同相差 1 ULP 时仍按并列处理），不改变任何离散刻度上的真实优劣
-STAPLE_EPS = 1e-9
-
 # 某帖的禁针闭区间：(起点, 终点)，均以页顶为原点、向下为正，单位 mm
 StapleForbiddenInterval = Tuple[float, float]
 
@@ -1521,27 +1516,40 @@ def _plan_staple_signature(
 
     第 i（1-based）个理想针位为
     ``上留边 + i × (页高 − 上留边 − 下留边) / (订针数 + 1)``；
-    在所有可行的递增整数毫米针位序列（避开留边、禁针闭区间，相邻针距不小于
-    下限）中，依次最小化：最大绝对偏差 → 偏差总和 → 针位序列字典序。
+    理想针位与各候选刻度的偏差按请求数值的最短十进制表示精确计算
+    （``_to_decimal`` 转十进制尺寸，除法结果用 ``Fraction`` 精确比例表达），
+    比较不设浮点容差——留边可能是 1e-10 量级的小数，容差会把最大偏差
+    真实不同的方案误判为并列。在所有可行的递增整数毫米针位序列（避开留边、
+    禁针闭区间，相邻针距不小于下限）中，依次最小化：
+    最大绝对偏差 → 偏差总和 → 针位序列字典序。
 
     返回 (针位列表, 最大绝对偏差 mm)。无可行排列时抛 ValueError。
     """
     ticks = _staple_allowed_ticks(
         page_height_mm, top_margin_mm, bottom_margin_mm, forbidden
     )
-    usable = page_height_mm - top_margin_mm - bottom_margin_mm
+    # 可用高度按最短十进制值精确计算（见 _to_decimal）；理想针位的除法
+    # （÷ (订针数 + 1)）不一定有有限十进制表示（如 49.5 / 3），用 Fraction
+    # 精确比例不会引入任何舍入
+    page_height_d = _to_decimal(page_height_mm)
+    top_margin_d = _to_decimal(top_margin_mm)
+    bottom_margin_d = _to_decimal(bottom_margin_mm)
+    with localcontext() as ctx:
+        ctx.prec = _decimal_prec(page_height_d, top_margin_d, bottom_margin_d)
+        usable_d = page_height_d - top_margin_d - bottom_margin_d
+    ideal_step = Fraction(usable_d) / (staple_count + 1)
     ideals = [
-        top_margin_mm + i * usable / (staple_count + 1)
+        Fraction(top_margin_d) + i * ideal_step
         for i in range(1, staple_count + 1)
     ]
     # 每个可用刻度相对各理想针位的偏差矩阵：deviation_matrix[i][j] 为第 i 根
-    # 针（自顶向下，从 0 计）落在 ticks[j] 时的绝对偏差
+    # 针（自顶向下，从 0 计）落在 ticks[j] 时的绝对偏差（精确比例）
     deviation_matrix = [
         [abs(tick - ideal) for tick in ticks] for ideal in ideals
     ]
 
-    def feasible_common(max_dev: float) -> bool:
-        """各针偏差均不超过 max_dev（容差 STAPLE_EPS）时，能否自顶向下放下
+    def feasible_common(max_dev: Fraction) -> bool:
+        """各针偏差均不超过 max_dev 时，能否自顶向下放下
         staple_count 根针。
 
         针位按针序逐根匹配：只要上一根已落在当前刻度之前（满足最小针距），
@@ -1552,15 +1560,12 @@ def _plan_staple_signature(
         for j, tick in enumerate(ticks):
             if last is not None and tick - last < min_spacing_mm:
                 continue
-            if deviation_matrix[chosen][j] <= max_dev + STAPLE_EPS:
+            if deviation_matrix[chosen][j] <= max_dev:
                 chosen += 1
                 last = tick
                 if chosen == staple_count:
                     return True
         return False
-
-    if not feasible_common(math.inf):
-        raise ValueError("无可行订针排列")
 
     # 第 1 级目标：最小化最大绝对偏差。候选上限取实际可达偏差值，二分贪心
     candidates = sorted(
@@ -1570,6 +1575,8 @@ def _plan_staple_signature(
             for j in range(len(ticks))
         }
     )
+    if not candidates or not feasible_common(candidates[-1]):
+        raise ValueError("无可行订针排列")
     lo, hi = 0, len(candidates) - 1
     while lo < hi:
         mid = (lo + hi) // 2
@@ -1579,26 +1586,19 @@ def _plan_staple_signature(
             lo = mid + 1
     optimal_max_dev = candidates[lo]
 
-    # 偏差按 STAPLE_EPS 量化成整数“档级”比较：仅抵消理想针位浮点运算的
-    # ULP 级差异（数学上相等的并列偏差不因舍入路径不同被误判优劣），
-    # 离散刻度间 ≥ 1 mm 的真实差异远大量化误差，不受影响
-    def level(dev: float) -> int:
-        return int(round(dev / STAPLE_EPS))
-
     # 第 2/3 级目标：在最大偏差不超过最优上限的前提下，DP 最小化
-    # (偏差总和档级, 针位序列字典序)。dp[j] = 当前针落在 ticks[j] 的最优状态，
-    # 元组 (偏差总和档级, 针位元组) 直接按目标顺序比较；针位元组随前缀增长，
-    # 天然实现字典序裁决。
-    INF_STATE: Optional[Tuple[int, Tuple[int, ...]]] = None
-    dp: List[Optional[Tuple[int, Tuple[int, ...]]]] = [None] * len(ticks)
+    # (偏差总和, 针位序列字典序)。dp[j] = 当前针落在 ticks[j] 的最优状态，
+    # 元组 (偏差总和, 针位元组) 直接按目标顺序比较；针位元组随前缀增长，
+    # 天然实现字典序裁决。偏差为精确比例，比较不设容差。
+    dp: List[Optional[Tuple[Fraction, Tuple[int, ...]]]] = [None] * len(ticks)
     for j, tick in enumerate(ticks):
-        if deviation_matrix[0][j] <= optimal_max_dev + STAPLE_EPS:
-            dp[j] = (level(deviation_matrix[0][j]), (tick,))
+        if deviation_matrix[0][j] <= optimal_max_dev:
+            dp[j] = (deviation_matrix[0][j], (tick,))
     for needle in range(1, staple_count):
-        ndp: List[Optional[Tuple[int, Tuple[int, ...]]]] = [
+        ndp: List[Optional[Tuple[Fraction, Tuple[int, ...]]]] = [
             None
         ] * len(ticks)
-        best: Optional[Tuple[int, Tuple[int, ...]]] = None
+        best: Optional[Tuple[Fraction, Tuple[int, ...]]] = None
         p = 0
         for j, tick in enumerate(ticks):
             # 纳入所有 ticks[p] <= tick - min_spacing 的前驱，保留最优
@@ -1608,26 +1608,26 @@ def _plan_staple_signature(
                 p += 1
             if (
                 best is not None
-                and deviation_matrix[needle][j] <= optimal_max_dev + STAPLE_EPS
+                and deviation_matrix[needle][j] <= optimal_max_dev
             ):
                 ndp[j] = (
-                    best[0] + level(deviation_matrix[needle][j]),
+                    best[0] + deviation_matrix[needle][j],
                     best[1] + (tick,),
                 )
         dp = ndp
 
-    final_best: Optional[Tuple[int, Tuple[int, ...]]] = INF_STATE
+    final_best: Optional[Tuple[Fraction, Tuple[int, ...]]] = None
     for state in dp:
         if state is not None and (final_best is None or state < final_best):
             final_best = state
     if final_best is None:  # pragma: no cover - 二分已保证可行
         raise ValueError("无可行订针排列")
     positions = list(final_best[1])
-    # 返回的最大偏差取所选排列的真实值（可能与最优上限仅差 ULP 级舍入）
+    # 返回的最大偏差取所选排列的真实值（精确比例转为浮点输出）
     actual_max_dev = max(
         abs(position - ideal) for position, ideal in zip(positions, ideals)
     )
-    return positions, actual_max_dev
+    return positions, float(actual_max_dev)
 
 
 def staple_plan(
@@ -1648,7 +1648,8 @@ def staple_plan(
     的禁针闭区间；同一帖内针位严格递增，相邻针距不小于 ``min_spacing_mm``。
 
     每帖在可行排列中依次最小化：最大绝对偏差 → 偏差总和 → 针位序列字典序；
-    理想针位见 :func:`_plan_staple_signature`。任一帖无可行排列时抛
+    理想针位与候选偏差按请求数值的最短十进制表示精确计算，比较不设浮点
+    容差（见 :func:`_plan_staple_signature`）。任一帖无可行排列时抛
     ``ValueError``，错误信息指出帖号。
 
     禁针区间按帖号（从 1 开始）给出；同一帖号只能出现一次，区间须为
