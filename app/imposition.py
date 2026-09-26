@@ -1482,26 +1482,27 @@ STAPLE_PAGE_HEIGHT_MAX_MM = 1000
 STAPLE_COUNT_MIN = 2
 STAPLE_COUNT_MAX = 4
 
-# 针位均为整数毫米刻度，最小离散误差即 0.5 mm；浮点比较取远小于该量级的
-# 容差，仅用于抵消理想针位浮点运算引入的 ULP 级偏差（如并列偏差因舍入路径
-# 不同相差 1 ULP 时仍按并列处理），不改变任何离散刻度上的真实优劣
-STAPLE_EPS = 1e-9
+# 针位均为整数毫米刻度；理想针位与各候选偏差一律按请求数值的最短十进制
+# 表示（Decimal(str(浮点))，见 :func:`_to_decimal`）转换为精确有理数
+# （Fraction）核算——小至 1e-10 mm 的留边就会让相邻刻度的真实偏差出现
+# 1e-10 量级差异，任何浮点容差或档级量化都会把真实优劣误判为并列。
 
 # 某帖的禁针闭区间：(起点, 终点)，均以页顶为原点、向下为正，单位 mm
 StapleForbiddenInterval = Tuple[float, float]
 
 
 def _staple_allowed_ticks(
-    page_height_mm: float,
-    top_margin_mm: float,
-    bottom_margin_mm: float,
-    forbidden: List[StapleForbiddenInterval],
+    page_height: Fraction,
+    top_margin: Fraction,
+    bottom_margin: Fraction,
+    forbidden: List[Tuple[Fraction, Fraction]],
 ) -> List[int]:
     """页高内可下针的整数毫米刻度（避开上/下留边与全部禁针闭区间）。"""
     ticks: List[int] = []
-    # range 上界含 page_height_mm 本身，再由严格不等式排除边界
-    for tick in range(1, int(math.floor(page_height_mm)) + 1):
-        if not (top_margin_mm < tick < page_height_mm - bottom_margin_mm):
+    upper = page_height - bottom_margin
+    # range 上界含页高整数刻度本身，再由严格不等式排除边界
+    for tick in range(1, int(page_height) + 1):
+        if not (top_margin < tick < upper):
             continue
         if any(lo <= tick <= hi for lo, hi in forbidden):
             continue
@@ -1519,30 +1520,40 @@ def _plan_staple_signature(
 ) -> Tuple[List[int], float]:
     """为单个帖规划递增针位。
 
-    第 i（1-based）个理想针位为
-    ``上留边 + i × (页高 − 上留边 − 下留边) / (订针数 + 1)``；
-    在所有可行的递增整数毫米针位序列（避开留边、禁针闭区间，相邻针距不小于
-    下限）中，依次最小化：最大绝对偏差 → 偏差总和 → 针位序列字典序。
+    所有尺寸先按请求数值的**最短十进制表示**转换为精确有理数（``Fraction``，
+    见 :func:`_to_decimal`）；第 i（1-based）个理想针位为
+    ``上留边 + i × (页高 − 上留边 − 下留边) / (订针数 + 1)``，
+    各候选刻度的偏差同样在精确值上计算，不设浮点容差。在所有可行的递增
+    整数毫米针位序列（避开留边、禁针闭区间，相邻针距不小于下限）中，
+    依次严格最小化：最大绝对偏差 → 偏差总和 → 针位序列字典序。
 
     返回 (针位列表, 最大绝对偏差 mm)。无可行排列时抛 ValueError。
     """
+    page_height = Fraction(_to_decimal(page_height_mm))
+    top_margin = Fraction(_to_decimal(top_margin_mm))
+    bottom_margin = Fraction(_to_decimal(bottom_margin_mm))
+    min_spacing = Fraction(_to_decimal(min_spacing_mm))
+    forbidden_exact = [
+        (Fraction(_to_decimal(lo)), Fraction(_to_decimal(hi)))
+        for lo, hi in forbidden
+    ]
     ticks = _staple_allowed_ticks(
-        page_height_mm, top_margin_mm, bottom_margin_mm, forbidden
+        page_height, top_margin, bottom_margin, forbidden_exact
     )
-    usable = page_height_mm - top_margin_mm - bottom_margin_mm
+    usable = page_height - top_margin - bottom_margin
     ideals = [
-        top_margin_mm + i * usable / (staple_count + 1)
+        top_margin + Fraction(i) * usable / (staple_count + 1)
         for i in range(1, staple_count + 1)
     ]
     # 每个可用刻度相对各理想针位的偏差矩阵：deviation_matrix[i][j] 为第 i 根
-    # 针（自顶向下，从 0 计）落在 ticks[j] 时的绝对偏差
+    # 针（自顶向下，从 0 计）落在 ticks[j] 时的绝对偏差（精确有理数）
     deviation_matrix = [
         [abs(tick - ideal) for tick in ticks] for ideal in ideals
     ]
 
-    def feasible_common(max_dev: float) -> bool:
-        """各针偏差均不超过 max_dev（容差 STAPLE_EPS）时，能否自顶向下放下
-        staple_count 根针。
+    def feasible_common(max_dev: Optional[Fraction]) -> bool:
+        """各针偏差均不超过 max_dev（None 表示不设偏差上限）时，能否自顶
+        向下放下 staple_count 根针。
 
         针位按针序逐根匹配：只要上一根已落在当前刻度之前（满足最小针距），
         当前刻度即可服务于下一根针；全部针都能落下即可行。
@@ -1550,19 +1561,20 @@ def _plan_staple_signature(
         chosen = 0
         last: Optional[int] = None
         for j, tick in enumerate(ticks):
-            if last is not None and tick - last < min_spacing_mm:
+            if last is not None and tick - last < min_spacing:
                 continue
-            if deviation_matrix[chosen][j] <= max_dev + STAPLE_EPS:
+            if max_dev is None or deviation_matrix[chosen][j] <= max_dev:
                 chosen += 1
                 last = tick
                 if chosen == staple_count:
                     return True
         return False
 
-    if not feasible_common(math.inf):
+    if not feasible_common(None):
         raise ValueError("无可行订针排列")
 
-    # 第 1 级目标：最小化最大绝对偏差。候选上限取实际可达偏差值，二分贪心
+    # 第 1 级目标：最小化最大绝对偏差。候选上限取实际可达偏差值（精确值），
+    # 二分贪心；全程精确比较，不设浮点容差
     candidates = sorted(
         {
             deviation_matrix[i][j]
@@ -1579,55 +1591,48 @@ def _plan_staple_signature(
             lo = mid + 1
     optimal_max_dev = candidates[lo]
 
-    # 偏差按 STAPLE_EPS 量化成整数“档级”比较：仅抵消理想针位浮点运算的
-    # ULP 级差异（数学上相等的并列偏差不因舍入路径不同被误判优劣），
-    # 离散刻度间 ≥ 1 mm 的真实差异远大量化误差，不受影响
-    def level(dev: float) -> int:
-        return int(round(dev / STAPLE_EPS))
-
     # 第 2/3 级目标：在最大偏差不超过最优上限的前提下，DP 最小化
-    # (偏差总和档级, 针位序列字典序)。dp[j] = 当前针落在 ticks[j] 的最优状态，
-    # 元组 (偏差总和档级, 针位元组) 直接按目标顺序比较；针位元组随前缀增长，
-    # 天然实现字典序裁决。
-    INF_STATE: Optional[Tuple[int, Tuple[int, ...]]] = None
-    dp: List[Optional[Tuple[int, Tuple[int, ...]]]] = [None] * len(ticks)
+    # (偏差总和, 针位序列字典序)。dp[j] = 当前针落在 ticks[j] 的最优状态，
+    # 元组 (偏差总和, 针位元组) 直接按目标顺序比较；针位元组随前缀增长，
+    # 天然实现字典序裁决。全部偏差为精确有理数，并列判定不依赖任何容差。
+    dp: List[Optional[Tuple[Fraction, Tuple[int, ...]]]] = [None] * len(ticks)
     for j, tick in enumerate(ticks):
-        if deviation_matrix[0][j] <= optimal_max_dev + STAPLE_EPS:
-            dp[j] = (level(deviation_matrix[0][j]), (tick,))
+        if deviation_matrix[0][j] <= optimal_max_dev:
+            dp[j] = (deviation_matrix[0][j], (tick,))
     for needle in range(1, staple_count):
-        ndp: List[Optional[Tuple[int, Tuple[int, ...]]]] = [
+        ndp: List[Optional[Tuple[Fraction, Tuple[int, ...]]]] = [
             None
         ] * len(ticks)
-        best: Optional[Tuple[int, Tuple[int, ...]]] = None
+        best: Optional[Tuple[Fraction, Tuple[int, ...]]] = None
         p = 0
         for j, tick in enumerate(ticks):
             # 纳入所有 ticks[p] <= tick - min_spacing 的前驱，保留最优
-            while p < j and ticks[p] <= tick - min_spacing_mm:
+            while p < j and ticks[p] <= tick - min_spacing:
                 if dp[p] is not None and (best is None or dp[p] < best):
                     best = dp[p]
                 p += 1
             if (
                 best is not None
-                and deviation_matrix[needle][j] <= optimal_max_dev + STAPLE_EPS
+                and deviation_matrix[needle][j] <= optimal_max_dev
             ):
                 ndp[j] = (
-                    best[0] + level(deviation_matrix[needle][j]),
+                    best[0] + deviation_matrix[needle][j],
                     best[1] + (tick,),
                 )
         dp = ndp
 
-    final_best: Optional[Tuple[int, Tuple[int, ...]]] = INF_STATE
+    final_best: Optional[Tuple[Fraction, Tuple[int, ...]]] = None
     for state in dp:
         if state is not None and (final_best is None or state < final_best):
             final_best = state
     if final_best is None:  # pragma: no cover - 二分已保证可行
         raise ValueError("无可行订针排列")
     positions = list(final_best[1])
-    # 返回的最大偏差取所选排列的真实值（可能与最优上限仅差 ULP 级舍入）
+    # 返回的最大偏差取所选排列的真实值（精确有理数转浮点，仅用于响应输出）
     actual_max_dev = max(
         abs(position - ideal) for position, ideal in zip(positions, ideals)
     )
-    return positions, actual_max_dev
+    return positions, float(actual_max_dev)
 
 
 def staple_plan(

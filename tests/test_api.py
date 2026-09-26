@@ -2201,6 +2201,25 @@ def test_staple_plan_min_spacing_tiebreak_example():
     assert sig["max_deviation_mm"] == pytest.approx(53 / 3, abs=1e-9)
 
 
+def test_staple_plan_tiny_margin_exact_deviation_comparison():
+    # 上留边 3e-10：理想针位 16.5000000002/33.0000000001，
+    # [17,33] 的真实最大偏差 0.4999999998 严格小于 [16,33] 的 0.5000000002，
+    # 差异（4e-10）再小也不按并列处理
+    body = {
+        **STAPLE_PLAN_BASE,
+        "page_height_mm": 50,
+        "staple_count": 2,
+        "top_margin_mm": 0.0000000003,
+        "bottom_margin_mm": 0.5,
+        "min_spacing_mm": 1,
+    }
+    response = client.post("/api/v1/impose/staple-plan", json=body)
+    assert response.status_code == 200
+    sig = response.json()["signatures"][0]
+    assert sig["staple_positions_mm"] == [17, 33]
+    assert sig["max_deviation_mm"] == pytest.approx(0.4999999998, abs=1e-15)
+
+
 def test_staple_plan_infeasible_signature_returns_422_with_index():
     body = {
         **STAPLE_PLAN_BASE,

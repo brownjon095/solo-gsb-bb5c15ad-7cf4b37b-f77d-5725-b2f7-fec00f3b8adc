@@ -54,6 +54,18 @@ def test_half_integer_ideals_lexicographic_tie():
     assert max_deviation == pytest.approx(0.5)
 
 
+def test_tiny_margin_deviations_compared_exactly():
+    # 上留边 3e-10：理想针位 16.5000000002/33.0000000001，
+    # [17,33] 的真实最大偏差 0.4999999998 严格小于 [16,33] 的 0.5000000002；
+    # 差异仅 4e-10，也不许按并列处理而落入字典序误选 [16,33]
+    positions, max_deviation = _plan(
+        page_height_mm=50, top_margin_mm=0.0000000003, bottom_margin_mm=0.5,
+        min_spacing_mm=1, staple_count=2,
+    )
+    assert positions == [17, 33]
+    assert max_deviation == pytest.approx(0.4999999998, abs=1e-15)
+
+
 def test_forbidden_closed_interval_endpoints_excluded():
     # 理想针位 30/50/70；禁区 [30, 30] 是闭区间，刻度 30 同样禁针
     positions, _ = _plan(
